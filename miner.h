@@ -122,6 +122,15 @@ static inline void le32enc(void *pp, uint32_t x)
 }
 #endif
 
+static inline void flipN(void *pp,void *x,size_t n)
+{
+	uint8_t *p = (uint8_t *)pp;
+	uint8_t *q = ((uint8_t *)x) + n - 1;
+	while(n--) {
+		*p++ = *q--;
+	}
+}
+
 #if JANSSON_MAJOR_VERSION >= 2
 #define JSON_LOADS(str, err_ptr) json_loads(str, 0, err_ptr)
 #define JSON_LOAD_FILE(path, err_ptr) json_load_file(path, 0, err_ptr)
@@ -155,9 +164,16 @@ extern int scanhash_sha256d(int thr_id, uint32_t *pdata,
 	const uint32_t *ptarget, uint32_t max_nonce, unsigned long *hashes_done);
 
 extern unsigned char *scrypt_buffer_alloc(int N);
+extern void scrypt_1024_1_1_256(const uint32_t *input, uint32_t *output,
+        uint32_t *midstate, unsigned char *scratchpad, int N);
+
 extern int scanhash_scrypt(int thr_id, uint32_t *pdata,
 	unsigned char *scratchbuf, const uint32_t *ptarget,
 	uint32_t max_nonce, unsigned long *hashes_done, int N);
+
+extern void sha256d_midstate(uint32_t *midstate,const uint32_t *pdata);
+extern bool sha256d_verify_nonce(const uint32_t *target,const uint32_t *midstate,
+	                         const uint32_t *data2,uint32_t ntime,uint32_t nonce);
 
 struct thr_info {
 	int		id;
@@ -240,6 +256,16 @@ struct stratum_ctx {
 	size_t xnonce2_size;
 	struct stratum_job job;
 	pthread_mutex_t work_lock;
+};
+
+struct stratum_work {
+        uint32_t target[8];
+	uint32_t midstate[8];
+	uint32_t data2[4];
+	size_t xnonce2_len;
+        unsigned char *xnonce2;
+	char *job_id;
+	char storage[164];
 };
 
 bool stratum_socket_full(struct stratum_ctx *sctx, int timeout);

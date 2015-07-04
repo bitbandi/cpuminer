@@ -1,4 +1,5 @@
 /*
+        printf("New job dispatched\n");
  * Copyright 2010 Jeff Garzik
  * Copyright 2012-2015 pooler
  *
@@ -37,9 +38,12 @@
 #include <curl/curl.h>
 #include "compat.h"
 #include "miner.h"
+#include "sfards.h"
 
 #define PROGRAM_NAME		"minerd"
 #define LP_SCANTIME		60
+
+#define MAX_NTIME_OFFSET		16
 
 #ifdef __linux /* Linux specific policy and affinity management */
 #include <sched.h>
@@ -90,6 +94,7 @@ static inline void affine_to_cpu(int id, int cpu)
 enum workio_commands {
 	WC_GET_WORK,
 	WC_SUBMIT_WORK,
+	WC_SUBMIT_STRATUM_WORK,
 };
 
 struct workio_cmd {
@@ -97,6 +102,7 @@ struct workio_cmd {
 	struct thr_info		*thr;
 	union {
 		struct work	*work;
+		struct stratum_work	*stratum_work;
 	} u;
 };
 
@@ -109,6 +115,10 @@ static const char *algo_names[] = {
 	[ALGO_SCRYPT]		= "scrypt",
 	[ALGO_SHA256D]		= "sha256d",
 };
+
+struct sfards_dev *sfards_dev = NULL;
+static int sfards_freq = 25;
+static char sfards_paths[256] = {0,};
 
 bool opt_debug = false;
 bool opt_protocol = false;
@@ -143,10 +153,12 @@ char *opt_proxy;
 long opt_proxy_type;
 struct thr_info *thr_info;
 static int work_thr_id;
+static int workfifo_thr_id;
 int longpoll_thr_id = -1;
 int stratum_thr_id = -1;
 struct work_restart *work_restart = NULL;
 static struct stratum_ctx stratum;
+static struct workfifo workfifo;
 
 pthread_mutex_t applog_lock;
 static pthread_mutex_t stats_lock;
@@ -195,7 +207,9 @@ Options:\n\
       --no-redirect     ignore requests to change the URL of the mining server\n\
   -q, --quiet           disable per-thread hashmeter output\n\
   -D, --debug           enable debug output\n\
-  -P, --protocol-dump   verbose dump of protocol-level activities\n"
+  -P, --protocol-dump   verbose dump of protocol-level activities\n\
+  -d, --device		path of serial port(sfards device only)\n\
+  -f, --freq		frequency of SF3301(sfards device only)\n"  
 #ifdef HAVE_SYSLOG_H
 "\
   -S, --syslog          use system log for output messages\n"
@@ -218,10 +232,12 @@ static char const short_options[] =
 #ifdef HAVE_SYSLOG_H
 	"S"
 #endif
-	"a:c:Dhp:Px:qr:R:s:t:T:o:u:O:V";
+	"a:c:Dhp:Px:qr:R:s:t:T:o:u:O:Vf:d:";
 
 static struct option const options[] = {
 	{ "algo", 1, NULL, 'a' },
+        { "device", 1, NULL, 'd' },
+        { "freq", 1, NULL, 'f' },
 #ifndef WIN32
 	{ "background", 0, NULL, 'B' },
 #endif
@@ -275,6 +291,28 @@ static pthread_mutex_t g_work_lock;
 static bool submit_old = false;
 static char *lp_id;
 
+#define WORKFIFO_NOTIFY_FLUSH			(0)
+#define WORKFIFO_NOTIFY_LOAD			(1)
+#define WORKFIFO_NOTIFY_EXIT			(2)
+#define WORKFIFO_SIZE				(16)
+#define WORKFIFO_MASK				(WORKFIFO_SIZE - 1)
+#define WORKFIFO_COUNT(wf)			(((wf)->widx + WORKFIFO_SIZE - (wf)->ridx) & WORKFIFO_MASK)
+#define WORKFIFO_FULL(wf)			((((wf)->widx + 1) & WORKFIFO_MASK) == (wf)->ridx)
+#define WORKFIFO_EMPTY(wf)			((wf)->widx  == (wf)->ridx)
+#define WORKFIFO_READ(wf)			((wf)->ridx = ((wf)->ridx + 1) & WORKFIFO_MASK)
+#define WORKFIFO_WRITE(wf)			((wf)->widx = ((wf)->widx + 1) & WORKFIFO_MASK)
+
+struct workfifo {
+	struct work work[WORKFIFO_SIZE];
+	int ridx;
+	int widx;
+	char *job_id;
+        int notify;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;	
+};
+
+
 static inline void work_free(struct work *w)
 {
 	free(w->txs);
@@ -297,6 +335,137 @@ static inline void work_copy(struct work *dest, const struct work *src)
 		memcpy(dest->xnonce2, src->xnonce2, src->xnonce2_len);
 	}
 }
+
+static int stratum_work_init(struct stratum_work *stratum_work,const struct work *src)
+{
+	if (strlen(src->job_id) + src->xnonce2_len >= 164) {
+		return -1;
+	}
+
+	sha256d_midstate(stratum_work->midstate,src->data);
+        memcpy(stratum_work->target,src->target,4 * 8);
+	memcpy(stratum_work->data2,src->data + 16,4 * 4);
+        stratum_work->xnonce2 = stratum_work->storage;
+        stratum_work->job_id = stratum_work->storage + src->xnonce2_len;
+	stratum_work->xnonce2_len = src->xnonce2_len;
+	memcpy(stratum_work->xnonce2,src->xnonce2,src->xnonce2_len);
+	strcpy(stratum_work->job_id,src->job_id);
+
+	return 0;
+}
+
+static void workfifo_init(struct workfifo *wf)
+{
+	memset(wf,0,sizeof(*wf));
+	pthread_mutex_init(&wf->lock,NULL);
+	pthread_cond_init(&wf->cond,NULL);
+}
+
+static void workfifo_destroy(struct workfifo *wf)
+{
+	pthread_mutex_destroy(&wf->lock);
+	pthread_cond_destroy(&wf->cond);
+	free(wf->job_id);
+}
+
+static void workfifo_notify(struct workfifo *wf,int notify)
+{
+	pthread_mutex_lock(&wf->lock);
+	
+	wf->notify |= (1 << notify);
+
+	pthread_mutex_unlock(&wf->lock);
+
+	pthread_cond_signal(&wf->cond);
+}
+
+static int workfifo_fetch(struct workfifo *wf,struct work *work)
+{
+	int count;
+	pthread_mutex_lock(&wf->lock);
+	
+	if (WORKFIFO_EMPTY(wf)) {
+		pthread_mutex_unlock(&wf->lock);
+		return -1;
+	}
+	
+	work_copy(work,&wf->work[wf->ridx]);
+	WORKFIFO_READ(wf);
+	count = WORKFIFO_COUNT(wf);
+
+	pthread_mutex_unlock(&wf->lock);
+	
+	if (count < (WORKFIFO_SIZE >> 1)) {
+		workfifo_notify(wf,WORKFIFO_NOTIFY_LOAD);
+	}
+
+	return 0;
+}
+
+static int workfifo_fetch_stratum(struct workfifo *wf,struct stratum_work *stratum_work)
+{
+	int count;
+	pthread_mutex_lock(&wf->lock);
+	
+	if (WORKFIFO_EMPTY(wf)) {
+		pthread_mutex_unlock(&wf->lock);
+		return -1;
+	}
+	
+        if (stratum_work_init(stratum_work,&wf->work[wf->ridx]) < 0) {		
+		pthread_mutex_unlock(&wf->lock);
+		return -1;
+	}
+
+	WORKFIFO_READ(wf);
+	count = WORKFIFO_COUNT(wf);
+
+	pthread_mutex_unlock(&wf->lock);
+	
+	if (count < (WORKFIFO_SIZE >> 1)) {
+		workfifo_notify(wf,WORKFIFO_NOTIFY_LOAD);
+	}
+
+	return 0;
+}
+
+static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work);
+
+static void *workfifo_thread(void *userdata)
+{
+	struct workfifo *wf = &workfifo;
+	
+	pthread_mutex_lock(&wf->lock);
+
+	for (;;) {
+		if (wf->notify)	{
+			if (wf->notify & (1 << WORKFIFO_NOTIFY_EXIT)) {
+				break;
+			} 
+			else if (wf->notify & (1 << WORKFIFO_NOTIFY_FLUSH)) {
+				wf->widx = wf->ridx;
+			}
+			wf->notify = 0;
+		}
+		else {
+			pthread_cond_wait(&wf->cond,&wf->lock);
+			continue;
+		} 
+		
+		pthread_mutex_unlock(&wf->lock);
+
+		while (stratum.job.job_id && !WORKFIFO_FULL(wf) && wf->notify == 0) {
+			stratum_gen_work(&stratum, &wf->work[wf->widx]);
+			WORKFIFO_WRITE(wf);			
+		}		
+		
+		pthread_mutex_lock(&wf->lock);
+	}
+	
+	pthread_mutex_unlock(&wf->lock);
+	return NULL;
+}
+
 
 static bool jobj_binary(const json_t *obj, const char *key,
 			void *buf, size_t buflen)
@@ -633,15 +802,51 @@ static void share_result(int result, const char *reason)
 	pthread_mutex_unlock(&stats_lock);
 	
 	sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
+/*
 	applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %s khash/s %s",
 		   accepted_count,
 		   accepted_count + rejected_count,
 		   100. * accepted_count / (accepted_count + rejected_count),
 		   s,
 		   result ? "(yay!!!)" : "(booooo)");
-
+*/
+	applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %s",
+		   accepted_count,
+		   accepted_count + rejected_count,
+		   100. * accepted_count / (accepted_count + rejected_count),
+		   result ? "(yay!!!)" : "(booooo)");
 	if (opt_debug && reason)
 		applog(LOG_DEBUG, "DEBUG: reject reason: %s", reason);
+}
+
+static bool submit_upstream_stratum_work(CURL *curl, struct stratum_work *stratum_work)
+{
+	json_t *val, *res, *reason;
+	bool rc = false;
+	uint32_t ntime, nonce;
+	char ntimestr[9], noncestr[9], *xnonce2str, *req;
+
+	le32enc(&ntime, stratum_work->data2[1]);
+	le32enc(&nonce, stratum_work->data2[3]);
+	bin2hex(ntimestr, (const unsigned char *)(&ntime), 4);
+	bin2hex(noncestr, (const unsigned char *)(&nonce), 4);
+	xnonce2str = abin2hex(stratum_work->xnonce2, stratum_work->xnonce2_len);
+	req = malloc(256 + strlen(rpc_user) + strlen(stratum_work->job_id) + 2 * stratum_work->xnonce2_len);
+	sprintf(req,
+		"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
+		rpc_user, stratum_work->job_id, xnonce2str, ntimestr, noncestr);
+	free(xnonce2str);
+
+	rc = stratum_send_line(&stratum, req);
+	free(req);
+	if (unlikely(!rc)) {
+		applog(LOG_ERR, "submit_upstream_work stratum_send_line failed");
+		goto out;
+	}
+	rc = true;
+
+out:
+	return rc;
 }
 
 static bool submit_upstream_work(CURL *curl, struct work *work)
@@ -651,14 +856,14 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	char s[345];
 	int i;
 	bool rc = false;
-
 	/* pass if the previous hash is not the current previous hash */
+/*
 	if (!submit_old && memcmp(work->data + 1, g_work.data + 1, 32)) {
 		if (opt_debug)
 			applog(LOG_DEBUG, "DEBUG: stale work detected, discarding");
 		return true;
 	}
-
+*/
 	if (have_stratum) {
 		uint32_t ntime, nonce;
 		char ntimestr[9], noncestr[9], *xnonce2str, *req;
@@ -836,7 +1041,8 @@ static void workio_cmd_free(struct workio_cmd *wc)
 	switch (wc->cmd) {
 	case WC_SUBMIT_WORK:
 		work_free(wc->u.work);
-		free(wc->u.work);
+	case WC_SUBMIT_STRATUM_WORK:
+		free(wc->u.stratum_work);
 		break;
 	default: /* do nothing */
 		break;
@@ -881,7 +1087,29 @@ static bool workio_submit_work(struct workio_cmd *wc, CURL *curl)
 	int failures = 0;
 
 	/* submit solution to bitcoin via JSON-RPC */
+	
 	while (!submit_upstream_work(curl, wc->u.work)) {
+		if (unlikely((opt_retries >= 0) && (++failures > opt_retries))) {
+			applog(LOG_ERR, "...terminating workio thread");
+			return false;
+		}
+
+		/* pause, then restart work-request loop */
+		applog(LOG_ERR, "...retry after %d seconds",
+			opt_fail_pause);
+		sleep(opt_fail_pause);
+	}
+
+	return true;
+}
+
+static bool workio_submit_stratum_work(struct workio_cmd *wc, CURL *curl)
+{
+	int failures = 0;
+
+	/* submit solution to bitcoin via JSON-RPC */
+	
+	while (!submit_upstream_stratum_work(curl, wc->u.stratum_work)) {
 		if (unlikely((opt_retries >= 0) && (++failures > opt_retries))) {
 			applog(LOG_ERR, "...terminating workio thread");
 			return false;
@@ -925,6 +1153,9 @@ static void *workio_thread(void *userdata)
 			break;
 		case WC_SUBMIT_WORK:
 			ok = workio_submit_work(wc, curl);
+			break;
+		case WC_SUBMIT_STRATUM_WORK:
+			ok = workio_submit_stratum_work(wc, curl);
 			break;
 
 		default:		/* should never happen */
@@ -1010,6 +1241,36 @@ err_out:
 	return false;
 }
 
+static bool submit_stratum_work(struct thr_info *thr, const struct stratum_work *work_in)
+{
+	struct workio_cmd *wc;
+	
+	/* fill out work request message */
+	wc = calloc(1, sizeof(*wc));
+	if (!wc)
+		return false;
+
+	wc->u.stratum_work = malloc(sizeof(*work_in));
+	if (!wc->u.work)
+		goto err_out;
+
+	wc->cmd = WC_SUBMIT_STRATUM_WORK;
+	wc->thr = thr;
+	memcpy(wc->u.stratum_work,work_in,sizeof(*work_in));
+	wc->u.stratum_work->xnonce2 = wc->u.stratum_work->storage;
+	wc->u.stratum_work->job_id = wc->u.stratum_work->storage + wc->u.stratum_work->xnonce2_len;
+	
+	/* send solution to workio thread */
+	if (!tq_push(thr_info[work_thr_id].q, wc))
+		goto err_out;
+
+	return true;
+
+err_out:
+	workio_cmd_free(wc);
+	return false;
+}
+
 static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 {
 	unsigned char merkle_root[64];
@@ -1058,6 +1319,220 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		diff_to_target(work->target, sctx->job.diff / 65536.0);
 	else
 		diff_to_target(work->target, sctx->job.diff);
+}
+
+static void *stratum_scrypt_thread(void *userdata)
+{
+	struct thr_info *mythr = userdata;
+	int thr_id = mythr->id;
+	struct work work = {{0}};
+	uint32_t max_nonce = 0xffffffffU ;
+	uint32_t end_nonce = 0xffffffffU;
+	unsigned char *scratchbuf = NULL;
+	char s[16];
+	int i;
+
+	/* Set worker threads to nice 19 and then preferentially to SCHED_IDLE
+	 * and if that fails, then SCHED_BATCH. No need for this to be an
+	 * error if it fails */
+	if (!opt_benchmark) {
+		setpriority(PRIO_PROCESS, 0, 19);
+		drop_policy();
+	}
+
+	/* Cpu affinity only makes sense if the number of threads is a multiple
+	 * of the number of CPUs */
+	if (num_processors > 1 && opt_n_threads % num_processors == 0) {
+		if (!opt_quiet)
+			applog(LOG_INFO, "Binding thread %d to cpu %d",
+			       thr_id, thr_id % num_processors);
+		affine_to_cpu(thr_id, thr_id % num_processors);
+	}
+	
+	scratchbuf = scrypt_buffer_alloc(opt_scrypt_n);
+	if (!scratchbuf) {
+		applog(LOG_ERR, "scrypt buffer allocation failed");
+		pthread_mutex_lock(&applog_lock);
+		exit(1);
+	}
+
+	while (1) {
+		unsigned long hashes_done;
+		struct timeval tv_start, tv_end, diff;
+		int64_t max64;
+		int retry = 0;
+		int rc;
+		
+		if (workfifo_fetch(&workfifo,&work) < 0) {
+			sleep(1);
+			continue;
+		}
+		
+		work_restart[thr_id].restart = 0;
+						
+		work.data[19] = 0xffffffffU;
+		max_nonce = end_nonce;
+
+		hashes_done = 0;
+
+		while(!work_restart[thr_id].restart) {
+			work.data[19]++;
+			/* scan nonces for a proof-of-work hash */
+                	rc = sfards_scanhash_scrypt(sfards_dev,thr_id, work.data,
+                        	                    scratchbuf, work.target,
+                                	            max_nonce, &hashes_done, opt_scrypt_n,
+                                        	    retry);
+
+			/* if nonce found, submit work */
+			if (rc == 1 && !opt_benchmark && !submit_work(mythr, &work))
+				break;					
+			if (rc < 0) {
+				sleep(1);
+				retry = 0;
+			}
+                        else if (rc == 0) {
+				break;
+                        }                     
+			else {
+				retry++;
+			}
+		}
+
+	}
+
+	tq_freeze(mythr->q);
+
+	return NULL;
+}
+
+static struct stratum_work *stratum_sha256d_matched_work(struct stratum_work *current,
+							 struct stratum_work *prev,
+							 uint32_t ntime0,uint32_t offset,
+							 uint32_t nonce,int chipid)
+{
+	uint32_t ntime;
+	struct stratum_work *matched = NULL;
+	ntime = ntime0 + offset + chipid - 1;
+	if (sha256d_verify_nonce(current->target,current->midstate,
+					current->data2,ntime,nonce)) {
+		matched = current;
+	}
+	else if (offset >= 8) {
+		ntime = ntime0 + offset + chipid - 1 - 8;
+		if (sha256d_verify_nonce(current->target,current->midstate,
+						current->data2,ntime,nonce)) {
+			matched = current;
+		}
+	}
+	else if (prev->job_id && !strcmp(prev->job_id,current->job_id)) {
+		ntime = ntime0 + MAX_NTIME_OFFSET + chipid - 1 - 8;
+		if (sha256d_verify_nonce(prev->target,prev->midstate,
+						prev->data2,ntime,nonce)) {
+			matched = prev;
+		}
+	}
+
+	if (matched) {
+		matched->data2[1] = ntime;
+		matched->data2[3] = nonce;
+	} 
+	
+	return matched;
+}
+			 
+static void *stratum_sha256d_thread(void *userdata)
+{
+	struct thr_info *mythr = userdata;
+	int thr_id = mythr->id;
+	struct stratum_work stratum_work[2];
+	int index = 0; 
+        int prev = 1;
+	uint32_t ntime0 = 0;
+        struct sfards_rpt nonce_rpt[8];
+	char s[16];
+	int i;
+        memset(stratum_work,0,sizeof(struct stratum_work) * 2);
+
+	/* Set worker threads to nice 19 and then preferentially to SCHED_IDLE
+	 * and if that fails, then SCHED_BATCH. No need for this to be an
+	 * error if it fails */
+	if (!opt_benchmark) {
+		setpriority(PRIO_PROCESS, 0, 19);
+		drop_policy();
+	}
+
+	/* Cpu affinity only makes sense if the number of threads is a multiple
+	 * of the number of CPUs */
+	if (num_processors > 1 && opt_n_threads % num_processors == 0) {
+		if (!opt_quiet)
+			applog(LOG_INFO, "Binding thread %d to cpu %d",
+			       thr_id, thr_id % num_processors);
+		affine_to_cpu(thr_id, thr_id % num_processors);
+	}
+	
+	while (1) {
+                struct timespec ts;
+                int count,i;
+		int rc;
+		uint32_t offset,ntime;
+		if (workfifo_fetch_stratum(&workfifo,&stratum_work[index]) < 0) {
+			sleep(1);
+			continue;
+		}
+		work_restart[thr_id].restart = 0;
+
+		ntime0 = stratum_work[index].data2[1];
+                
+		for (offset = 0;offset < MAX_NTIME_OFFSET;offset += 8) {
+			rc = sfards_send_sha256d_task(sfards_dev,thr_id,
+			 				&stratum_work[index],ntime0 + offset);
+			if (rc > 0) {
+				sleep(1);
+				continue;
+			}
+			else if (rc < 0) {
+				break;
+			}
+			
+                        clock_gettime(CLOCK_REALTIME, &ts);
+                        ts.tv_nsec += 50000000;
+
+			while(!work_restart[thr_id].restart) {
+				count = sfards_wait_sha256d_nonce(sfards_dev,thr_id,nonce_rpt,8,&ts);
+                                if (count <= 0) {
+					break;
+				}
+                                for (i = 0;i < count;i++) {
+					struct stratum_work *matched = NULL;
+					matched = stratum_sha256d_matched_work(&stratum_work[index],
+					  				       &stratum_work[prev],
+									       ntime0,offset,
+									       nonce_rpt[i].data,
+									       nonce_rpt[i].chipid);
+					if (matched != NULL) {
+						if (submit_stratum_work(mythr,matched)) {
+					    		applog(LOG_INFO, "Got Nonce--> thread %d,chipid %d",
+									 thr_id,nonce_rpt[i].chipid);
+						} 
+					} 
+					else {
+						applog(LOG_INFO, "Invalid Nonce--> thread %d,chipid %d",
+									 thr_id,nonce_rpt[i].chipid);
+					}
+				}				
+			}
+                        if (work_restart[thr_id].restart) {
+				break;
+			}				
+		} 
+
+		prev = index;
+        	index = (index + 1) & 1;
+	}						
+
+	tq_freeze(mythr->q);
+
+	return NULL;
 }
 
 static void *miner_thread(void *userdata)
@@ -1390,6 +1865,16 @@ static void *stratum_thread(void *userdata)
 		}
 
 		if (stratum.job.job_id &&
+		    (!workfifo.job_id || strcmp(stratum.job.job_id,workfifo.job_id))) {
+			free(workfifo.job_id);
+			workfifo.job_id = strdup(stratum.job.job_id);
+			workfifo_notify(&workfifo,WORKFIFO_NOTIFY_FLUSH);
+			if (stratum.job.clean) {
+				applog(LOG_INFO, "Stratum requested work restart");
+				restart_threads();
+			}
+		}			
+/*
 		    (!g_work_time || strcmp(stratum.job.job_id, g_work.job_id))) {
 			pthread_mutex_lock(&g_work_lock);
 			stratum_gen_work(&stratum, &g_work);
@@ -1400,6 +1885,7 @@ static void *stratum_thread(void *userdata)
 				restart_threads();
 			}
 		}
+*/
 		
 		if (!stratum_socket_full(&stratum, 120)) {
 			applog(LOG_ERR, "Stratum connection timed out");
@@ -1495,6 +1981,20 @@ static void parse_arg(int key, char *arg, char *pname)
 	int v, i;
 
 	switch(key) {
+        case 'd':
+                if (strlen(sfards_paths) == 0)
+                {
+                    strcpy(sfards_paths,arg);
+                }
+                else if (strlen(sfards_paths) + strlen(arg) < 253)
+                {
+                    strcat(sfards_paths,",");
+                    strcat(sfards_paths,arg);
+                }
+                break;
+        case 'f':
+                sfards_freq = atoi(arg);
+                break;
 	case 'a':
 		for (i = 0; i < ARRAY_SIZE(algo_names); i++) {
 			v = strlen(algo_names[i]);
@@ -1829,6 +2329,8 @@ int main(int argc, char *argv[])
 	pthread_mutex_init(&stratum.sock_lock, NULL);
 	pthread_mutex_init(&stratum.work_lock, NULL);
 
+	workfifo_init(&workfifo);
+
 	flags = opt_benchmark || (strncasecmp(rpc_url, "https://", 8) &&
 	                          strncasecmp(rpc_url, "stratum+tcps://", 15))
 	      ? (CURL_GLOBAL_ALL & ~CURL_GLOBAL_SSL)
@@ -1873,6 +2375,34 @@ int main(int argc, char *argv[])
 	if (!opt_n_threads)
 		opt_n_threads = num_processors;
 
+        if (sfards_paths[0] != 0)
+        {
+                sfards_dev = sfards_new(opt_algo == ALGO_SCRYPT ?
+                                        PORT_TYPE_SCRYPT : PORT_TYPE_SHA256,
+                                        sfards_freq);                
+                if (sfards_dev != NULL)
+                {
+                        char *p = sfards_paths;
+                        char *q;
+                        int n = 0;
+                        do
+                        {
+                                q = strchr(p, ',');
+                                if (q != NULL)
+                                {
+                                        *q = '\0';
+                                }
+                                if (sfards_port(sfards_dev,n,p) < 0)
+                                {
+                                    break;
+                                }
+                                n++;
+                                p = q + 1;
+                        }while(q != NULL);
+                        opt_n_threads = n;
+                }
+        }
+
 #ifdef HAVE_SYSLOG_H
 	if (use_syslog)
 		openlog("cpuminer", LOG_PID, LOG_USER);
@@ -1882,7 +2412,7 @@ int main(int argc, char *argv[])
 	if (!work_restart)
 		return 1;
 
-	thr_info = calloc(opt_n_threads + 3, sizeof(*thr));
+	thr_info = calloc(opt_n_threads + 4, sizeof(*thr));
 	if (!thr_info)
 		return 1;
 	
@@ -1904,9 +2434,23 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	/* init workfifo thread info */
+	workfifo_thr_id = opt_n_threads + 1;
+	thr = &thr_info[workfifo_thr_id];
+	thr->id = workfifo_thr_id;
+	thr->q = tq_new();
+	if (!thr->q)
+		return 1;
+
+	/* start work fifo thread */
+	if (pthread_create(&thr->pth, NULL, workfifo_thread, thr)) {
+		applog(LOG_ERR, "workfifo thread create failed");
+		return 1;
+	}
+
 	if (want_longpoll && !have_stratum) {
 		/* init longpoll thread info */
-		longpoll_thr_id = opt_n_threads + 1;
+		longpoll_thr_id = opt_n_threads + 2;
 		thr = &thr_info[longpoll_thr_id];
 		thr->id = longpoll_thr_id;
 		thr->q = tq_new();
@@ -1921,7 +2465,7 @@ int main(int argc, char *argv[])
 	}
 	if (want_stratum) {
 		/* init stratum thread info */
-		stratum_thr_id = opt_n_threads + 2;
+		stratum_thr_id = opt_n_threads + 3;
 		thr = &thr_info[stratum_thr_id];
 		thr->id = stratum_thr_id;
 		thr->q = tq_new();
@@ -1946,10 +2490,23 @@ int main(int argc, char *argv[])
 		thr->q = tq_new();
 		if (!thr->q)
 			return 1;
-
-		if (unlikely(pthread_create(&thr->pth, NULL, miner_thread, thr))) {
-			applog(LOG_ERR, "thread %d create failed", i);
-			return 1;
+		if (sfards_dev) {
+			if (opt_algo == ALGO_SHA256D) {
+				if (unlikely(pthread_create(&thr->pth, NULL, stratum_sha256d_thread, thr))) {
+					applog(LOG_ERR, "thread %d create failed", i);
+					return 1;
+				}
+			}
+			else if (unlikely(pthread_create(&thr->pth, NULL, stratum_scrypt_thread, thr))) {
+				applog(LOG_ERR, "thread %d create failed", i);
+				return 1;
+			}
+		}
+		else {
+			if (unlikely(pthread_create(&thr->pth, NULL, miner_thread, thr))) {
+				applog(LOG_ERR, "thread %d create failed", i);
+				return 1;
+			}
 		}
 	}
 
@@ -1960,6 +2517,15 @@ int main(int argc, char *argv[])
 
 	/* main loop - simply wait for workio thread to exit */
 	pthread_join(thr_info[work_thr_id].pth, NULL);
+	
+	workfifo_notify(&workfifo,WORKFIFO_NOTIFY_EXIT);
+	pthread_join(thr_info[workfifo_thr_id].pth, NULL);	
+	workfifo_destroy(&workfifo);
+//_exit:
+        if (sfards_dev)
+        {
+                sfards_destroy(sfards_dev);
+        }
 
 	applog(LOG_INFO, "workio thread dead, exiting.");
 

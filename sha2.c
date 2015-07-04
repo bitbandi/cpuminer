@@ -15,8 +15,7 @@
 #include <inttypes.h>
 
 #if defined(USE_ASM) && \
-	(defined(__x86_64__) || \
-	 (defined(__arm__) && defined(__APCS_32__)) || \
+	((defined(__arm__) && defined(__APCS_32__)) || \
 	 (defined(__powerpc__) || defined(__ppc__) || defined(__PPC__)))
 #define EXTERN_SHA256
 #endif
@@ -184,7 +183,8 @@ static const uint32_t sha256d_hash1[16] = {
 	0x00000000, 0x00000000, 0x00000000, 0x00000100
 };
 
-static void sha256d_80_swap(uint32_t *hash, const uint32_t *data)
+//static void sha256d_80_swap(uint32_t *hash, const uint32_t *data)
+void sha256d_80_swap(uint32_t *hash, const uint32_t *data)
 {
 	uint32_t S[16];
 	int i;
@@ -224,7 +224,8 @@ void sha256d(unsigned char *hash, const unsigned char *data, int len)
 		be32enc((uint32_t *)hash + i, T[i]);
 }
 
-static inline void sha256d_preextend(uint32_t *W)
+//static inline void sha256d_preextend(uint32_t *W)
+void sha256d_preextend(uint32_t *W)
 {
 	W[16] = s1(W[14]) + W[ 9] + s0(W[ 1]) + W[ 0];
 	W[17] = s1(W[15]) + W[10] + s0(W[ 2]) + W[ 1];
@@ -244,7 +245,8 @@ static inline void sha256d_preextend(uint32_t *W)
 	W[31] =                     s0(W[16]) + W[15];
 }
 
-static inline void sha256d_prehash(uint32_t *S, const uint32_t *W)
+//static inline void sha256d_prehash(uint32_t *S, const uint32_t *W)
+void sha256d_prehash(uint32_t *S, const uint32_t *W)
 {
 	uint32_t t0, t1;
 	RNDr(S, W, 0);
@@ -259,7 +261,8 @@ void sha256d_ms(uint32_t *hash, uint32_t *W,
 
 #else
 
-static inline void sha256d_ms(uint32_t *hash, uint32_t *W,
+//static inline void sha256d_ms(uint32_t *hash, uint32_t *W,
+void sha256d_ms(uint32_t *hash, uint32_t *W,
 	const uint32_t *midstate, const uint32_t *prehash)
 {
 	uint32_t S[64];
@@ -631,3 +634,38 @@ int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 	pdata[19] = n;
 	return 0;
 }
+
+void sha256d_midstate(uint32_t *midstate,const uint32_t *pdata)
+{
+	sha256_init(midstate);
+	sha256_transform(midstate, pdata, 0);
+}
+
+bool sha256d_verify_nonce(const uint32_t *target,const uint32_t *midstate,
+                         const uint32_t *data2,uint32_t ntime,uint32_t nonce)
+{
+        uint32_t data[16] __attribute__((aligned(128)));
+        uint32_t prehash[16] __attribute__((aligned(32)));
+        uint32_t hash[8] __attribute__((aligned(32)));
+	int i;
+
+	memset(data,0,16 * 4);
+	data[0] = data2[0];
+	//be32enc(&data[1],ntime);
+	data[1] =ntime;
+        data[2] = data2[2];
+        data[3] = nonce;
+        data[4] = 0x80000000;
+        data[15] = 0x00000280;
+	sha256d_preextend(data);
+	memcpy(prehash, midstate, 32);
+	sha256_transform(prehash, data, 0);
+	memcpy(prehash + 8, sha256d_hash1 + 8, 32);
+	sha256_init(hash);
+        sha256_transform(hash, prehash, 0);
+        for (i = 0; i < 8; i++)
+                hash[i] = swab32(hash[i]);
+	return fulltest(hash, target);
+}
+
+
