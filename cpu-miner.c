@@ -133,6 +133,7 @@ bool have_stratum = false;
 bool use_syslog = false;
 static bool opt_background = false;
 static bool opt_quiet = false;
+static bool opt_extranonce_subscribe = false;
 static int opt_retries = -1;
 static int opt_fail_pause = 30;
 int opt_timeout = 0;
@@ -190,6 +191,7 @@ Options:\n\
   -u, --user=USERNAME   username for mining server\n\
   -p, --pass=PASSWORD   password for mining server\n\
       --cert=FILE       certificate for mining server using SSL\n\
+      --extranonce-subscribe  Enable 'extranonce' stratum subscribe\n\
   -x, --proxy=[PROTOCOL://]HOST[:PORT]  connect through a proxy\n\
   -t, --threads=N       number of miner threads (default: number of processors)\n\
   -r, --retries=N       number of times to retry if a network call fails\n\
@@ -247,6 +249,7 @@ static struct option const options[] = {
 	{ "coinbase-sig", 1, NULL, 1015 },
 	{ "config", 1, NULL, 'c' },
 	{ "debug", 0, NULL, 'D' },
+	{ "extranonce-subscribe", 0, NULL, 1016 },
 	{ "help", 0, NULL, 'h' },
 	{ "no-gbt", 0, NULL, 1011 },
 	{ "no-getwork", 0, NULL, 1010 },
@@ -1852,6 +1855,7 @@ static void *stratum_thread(void *userdata)
 
 			if (!stratum_connect(&stratum, stratum.url) ||
 			    !stratum_subscribe(&stratum) ||
+			    (opt_extranonce_subscribe && !subscribe_extranonce(&stratum)) ||
 			    !stratum_authorize(&stratum, rpc_user, rpc_pass)) {
 				stratum_disconnect(&stratum);
 				if (opt_retries >= 0 && ++failures > opt_retries) {
@@ -2210,6 +2214,9 @@ static void parse_arg(int key, char *arg, char *pname)
 			show_usage_and_exit(1);
 		}
 		strcpy(coinbase_sig, arg);
+		break;
+	case 1016:
+		opt_extranonce_subscribe = true;
 		break;
 	case 'S':
 		use_syslog = true;
